@@ -1,20 +1,31 @@
+import threading
 import time
 from collections import deque
 
+
 class SubseaCleaningRobot:
-    def __init__(self):
+    """
+    좌/우 궤도(차동 구동) 로봇.
+    hardware : hardware.Hardware (실기)  / None
+    motion_sim : 시뮬레이션 객체 (forward/turn 시 가상 위치 갱신) / None
+    """
+
+    def __init__(self, hardware=None, motion_sim=None):
+        self.hw = hardware
+        self.sim = motion_sim
+        self.motion_listeners = []   # f(kind, value): 추측 항법 등
         self.state = "BOOTING"
+        self.action = "-"
         self.led_level = 50
         self.camera_fps = 30
-        self.camera_res = "1080p"
         self.brush_rpm = 0
-        self.suction_power = 0
         self.magnetic_hold = False
-        
         self.network_connected = False
         self.telemetry_buffer = deque(maxlen=1000)
-        self.position = (0, 0)
+        self._stop_lock = threading.Lock()
+        self.stopped = False
 
+    # ---------------- 부팅 / 준비 ----------------
     def boot_and_connect(self, retries=3):
         print("[Robot] Power ON: 라즈베리파이 부팅 완료")
         backoff = 1
@@ -32,64 +43,104 @@ class SubseaCleaningRobot:
 
     def init_sensors(self, turbidity_high=True):
         print("[Robot] MissionStart: 센서 및 조명 구동 시작")
-        self.brush_rpm = 0
-        self.suction_power = 0
-        
         if turbidity_high:
-            print("[Robot] 고탁도/어두움 감지 -> LED 밝기 증강 및 노출/FPS 자동 보정")
-            self.led_level = 90
-            self.camera_fps = 15
-        print("[Robot] LiDAR 거리 측정 초기화 완료 (Ready)")
+            self.boost_led()
         self.state = "SENSORS_READY"
         return True
 
+    def boost_led(self):
+        print("[Robot] 고탁도/어두움 감지 -> LED 밝기 증강 및 노출/FPS 자동 보정")
+        self.led_level = 90
+        self.camera_fps = 15
+
     def approach_and_attach(self, lidar_distance, slip_detected=False):
         print(f"[Robot] 선체 거리 측정값: {lidar_distance}cm")
-        if lidar_distance > 10:
-            print("[Robot] 안전거리 만족 -> 저속 전진")
-        
         if slip_detected:
             print("[Robot] Warning: 슬립/이탈 감지! 속도 감속 및 자력 재확보 시도")
-            self.magnetic_hold = True
-            print("[Robot] SlipRecovered: 자석 트랙 표면 재밀착 성공")
-        else:
-            self.magnetic_hold = True
-            
+        self.magnetic_hold = True
         print("[Robot] ApproachReady: 선체 밀착 완료, 청소 준비 상태 도달")
-        self.state = "ATTACHED"
+        self.state = "READY"
 
-    def set_cleaning_actuators(self, rpm=800, suction=100):
+    # ---------------- 주행 (차동 구동) ----------------
+    def _go(self, l_dir, r_dir, sec, speed):
+        if self.hw:
+            self.hw.run(l_dir, r_dir, sec, speed, lambda: self.stopped)
+
+    def forward(self, steps=1):
+        if self.stopped:
+            return False
+        self.action = "FORWARD"
+        if self.hw:
+            self._go(1, 1, steps * self.hw.cfg["step_sec"], self.hw.cfg["forward_speed"])
+        ok = self.sim.move(steps) if self.sim else True
+        self._notify("move", steps)
+        return ok and not self.stopped
+
+    def _notify(self, kind, value):
+        for f in self.motion_listeners:
+            f(kind, value)
+
+    def backward(self, steps=1):
+        if self.stopped:
+            return False
+        self.action = "BACKWARD"
+        if self.hw:
+            self._go(-1, -1, steps * self.hw.cfg["step_sec"], self.hw.cfg["forward_speed"])
+        ok = self.sim.move(-steps) if self.sim else True
+        self._notify("move", -steps)
+        return ok and not self.stopped
+
+    def turn(self, deg):
+        """deg > 0 : 우회전,  deg < 0 : 좌회전 (제자리 회전 - 양쪽 궤도 반대 방향)"""
+        if self.stopped or abs(deg) < 1:
+            return not self.stopped
+        self.action = f"TURN {'R' if deg > 0 else 'L'} {abs(deg):.0f}°"
+        if self.hw:
+            cfg = self.hw.cfg
+            s = 1 if deg > 0 else -1
+            self._go(s, -s, abs(deg) / 90.0 * cfg["turn_90_sec"], cfg["turn_speed"])
+        if self.sim:
+            self.sim.turn(deg)
+        self._notify("turn", deg)
+        return not self.stopped
+
+    def set_brush(self, rpm=800):
+        if self.stopped:
+            return
         self.brush_rpm = rpm
-        self.suction_power = suction
-        print(f"[Actuator] 브러시 가동: {self.brush_rpm} RPM, 흡입구: {self.suction_power}%")
+        if self.hw and self.hw.brush:
+            self.hw.set_brush_duty(rpm / self.hw.cfg["brush_max_rpm"])
+            print(f"[Actuator] 브러시: {rpm} RPM")
 
-    def handle_overload(self):
-        print("[Actuator] 부하/전류 상승 감지 -> 출력 강하(감속)")
-        self.brush_rpm = int(self.brush_rpm * 0.6)
+    # ---------------- 정지 ----------------
+    def emergency_stop(self, reason="사용자 요청"):
+        """즉시 하드웨어 안전 정지. 어느 스레드에서 호출해도 안전(1회만 실행)."""
+        with self._stop_lock:
+            if self.stopped:
+                return
+            self.stopped = True
+            if self.hw:
+                self.hw.stop_all()
+            self.brush_rpm = 0
+            self.state, self.action = "E-STOP", "STOP"
+            print(f"[Robot] !!! 하드웨어 안전 정지 실행 ({reason}) - 궤도/브러시 모터 OFF, 자석 흡착 유지")
 
-    def handle_suction_clog(self):
-        print("[Actuator] 흡입구 막힘 감지! -> 역세(Reverse Flush) 및 펄스 진동 루틴 가동")
-        time.sleep(0.3)
-        return False
+    def safe_shutdown(self):
+        with self._stop_lock:
+            if self.stopped:
+                return
+            self.stopped = True
+            if self.hw:
+                self.hw.stop_all()
+            self.brush_rpm = 0
+            self.state, self.action = "STOPPED", "STOP"
+            print("[Robot] 궤도/브러시 모터 정지 완료 (안전 정지 상태)")
 
-    def log_telemetry(self, current_pos, progress):
-        self.position = current_pos
-        payload = {
-            "time": time.time(),
-            "pos": self.position,
-            "progress": f"{progress:.1f}%",
-            "rpm": self.brush_rpm,
-            "suction": self.suction_power,
-            "led": self.led_level
-        }
+    # ---------------- 텔레메트리 ----------------
+    def log_telemetry(self, zones, passes):
+        payload = {"time": time.time(), "state": self.state, "action": self.action,
+                   "zones": zones, "passes": passes, "led": self.led_level}
         if self.network_connected:
             return f"[Telemetry UpLink] {payload}"
-        else:
-            self.telemetry_buffer.append(payload)
-            return f"[Buffer Saved] 네트워크 두절. 로컬 큐에 저장 (대기 건수: {len(self.telemetry_buffer)})"
-
-    def flush_buffer_to_server(self):
-        print(f"[Sync] 무선 링크 복구! 로컬 버퍼 {len(self.telemetry_buffer)}건 일괄 전송 시작")
-        while self.telemetry_buffer:
-            self.telemetry_buffer.popleft()
-        print("[Sync] 텔레메트리 동기화 완료")
+        self.telemetry_buffer.append(payload)
+        return f"[Buffer Saved] 로컬 큐 저장 (대기 {len(self.telemetry_buffer)}건)"
